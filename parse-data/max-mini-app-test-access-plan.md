@@ -131,7 +131,7 @@ The validator must follow the MAX documentation's `WebAppData` algorithm:
 
 1. Parse the `initData` string into key/value pairs. Split each pair at the **first** `=` so values containing `=` are not truncated.
 2. Reject malformed pairs and duplicate parameter names. Require exactly one `hash` parameter.
-3. URL-decode parameter values once, following the equivalent of JavaScript `decodeURIComponent`. Do not accidentally convert literal `+` characters to spaces as form-style decoding can do.
+3. URL-decode each parameter value exactly once using query/form decoding semantics from the official Java `URLDecoder.decode` and Go `url.QueryUnescape` examples: a raw `+` becomes a space, while `%2B` becomes a literal `+`. In C#, use `System.Net.WebUtility.UrlDecode`.
 4. Save the received `hash` and exclude it from the signed parameter set.
 5. Sort the remaining parameters by key in ordinal/alphabetical order.
 6. Build `launch_params` as `key=value` lines separated by `\n` (LF, `0x0A`), with no extra spaces.
@@ -278,7 +278,9 @@ Cover at least:
 - Duplicate non-hash parameters are rejected.
 - Malformed key/value pairs are rejected.
 - Malformed percent-encoding is rejected.
-- Values containing encoded `&`, `=`, Unicode, or literal `+` are handled correctly.
+- A raw `+` in a value is decoded as a space.
+- An encoded `%2B` in a value is decoded as a literal `+`; `%20` is decoded as a space.
+- Values containing encoded `&`, `=`, and Unicode are handled correctly after one decoding pass.
 - Incorrect hash is rejected.
 - Expired data is rejected.
 - Excessively future-dated data is rejected.
@@ -405,6 +407,7 @@ using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
+using System.Net;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -439,36 +442,29 @@ public sealed class MaxInitDataValidator : IMaxInitDataValidator
         // Split at the first '=' because a value may contain '=' characters.
         var parameters = new Dictionary<string, string>(StringComparer.Ordinal);
 
-        try
+        foreach (var part in initData.Split('&'))
         {
-            foreach (var part in initData.Split('&'))
+            var separator = part.IndexOf('=');
+
+            if (separator <= 0)
+                return false;
+
+            var key = part[..separator];
+            var encodedValue = part[(separator + 1)..];
+
+            if (string.IsNullOrEmpty(key) ||
+                !HasValidPercentEncoding(encodedValue))
             {
-                var separator = part.IndexOf('=');
-
-                if (separator <= 0)
-                    return false;
-
-                var key = part[..separator];
-                var encodedValue = part[(separator + 1)..];
-
-                if (string.IsNullOrEmpty(key) ||
-                    !HasValidPercentEncoding(encodedValue))
-                {
-                    return false;
-                }
-
-                // Uri.UnescapeDataString performs percent-decoding and, unlike
-                // form decoding, preserves a literal '+' character as '+'.
-                var value = Uri.UnescapeDataString(encodedValue);
-
-                // Reject duplicate names rather than allowing ambiguous input.
-                if (!parameters.TryAdd(key, value))
-                    return false;
+                return false;
             }
-        }
-        catch (UriFormatException)
-        {
-            return false;
+
+            // Match the URLDecoder / QueryUnescape behavior used in MAX's
+            // Java and Go examples: '+' becomes a space and '%2B' becomes '+'.
+            var value = WebUtility.UrlDecode(encodedValue);
+
+            // Reject duplicate names rather than allowing ambiguous input.
+            if (!parameters.TryAdd(key, value))
+                return false;
         }
 
         if (!parameters.TryGetValue("hash", out var receivedHash))
@@ -606,7 +602,7 @@ public sealed class MaxInitDataValidator : IMaxInitDataValidator
 Implementation notes:
 
 - The first HMAC uses `WebAppData` as the key and the bot token as the message. The second HMAC uses the derived secret key and the canonical `launch_params` string.
-- Decode each parameter value once. Do not use form-style decoding that converts literal `+` characters to spaces.
+- Decode each parameter value exactly once with `WebUtility.UrlDecode` (UTF-8, query/form semantics), matching the official Java and Go examples. Do not use `Uri.UnescapeDataString`, which leaves a raw `+` unchanged.
 - Reject duplicate parameters, including duplicate `hash` values, to avoid ambiguous input.
 - Verify the signature before parsing `user.id` or using it for authorization.
 - Never log `initData`, the bot token, or the complete user payload.
